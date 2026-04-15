@@ -1,22 +1,23 @@
-# GitHub Integration - OSS MNS Relay Mode
+# GitHub Integration - Direct IacService Mode
 
-CI/CD integration solution based on GitHub Actions and Alibaba Cloud IacService, implementing automated Terraform Stack deployments through the OSS MNS relay mode.
+A CI/CD integration solution based on GitHub Actions and Alibaba Cloud IacService, which directly triggers Terraform stack automated deployment through IacService API.
 
-> **🌐 Language**：[中文文档](README-CN.md) | [English Docs](README.md)
+> **🌐 Language**: [中文文档](README-CN.md) | [English Docs](README.md)
 
 ## Table of Contents
 
 - [Overview](#overview)
 - [Prerequisites](#prerequisites)
+  - [Prepare Code Repository](#prepare-code-repository)
   - [Initialize Cloud Infrastructure](#initialize-cloud-infrastructure)
   - [GitHub Configuration](#github-configuration)
 - [GitHub Actions Workflow Configuration](#github-actions-workflow-configuration)
   - [Workflow Files](#workflow-files)
   - [Workflow Dependencies](#workflow-dependencies)
 - [Daily Usage](#daily-usage)
-  - [Create IacService Stacks](#create-iac-service-stacks)
-  - [Change Workflow](#change-workflow)
-  - [Runtime Parameter Reference](#runtime-parameter-reference)
+  - [Create IacService Stack](#create-iacservice-stack)
+  - [Change Process](#change-process)
+  - [Running Parameters](#running-parameters)
 - [Operations Reference](#operations-reference)
   - [Troubleshooting](#troubleshooting)
   - [CI Dependencies](#ci-dependencies)
@@ -28,46 +29,46 @@ CI/CD integration solution based on GitHub Actions and Alibaba Cloud IacService,
 
 # Overview
 
+This document details the complete operation process for configuring and managing stacks when GitHub serves as the Version Control System (VCS).
+
+> **Prerequisite**: This document assumes you have completed preliminary preparation and IacService configuration. For basic configuration, please refer to the VCS-driven Stack CI/CD Operation Guide.
+
+The core advantages of GitHub integration are:
+- Leverage GitHub Actions as the CI/CD engine
+- Define automation processes through Workflow files
+- Deep integration with GitHub's native Pull Request, Code Review, Branch Protection, and other collaboration features
+- Achieve a complete closed loop of "automatic deployment triggered upon code review approval"
+
 ```
-Developer → PR Comment → GitHub Actions → OSS (code package + trigger file) → MNS → IacService → Execute Deployment → OSS (results) → GitHub Actions → PR Comment
+Developer → PR Comment → GitHub Actions → IacService API(Upload Code + Trigger Execution) → Deploy → IacService API(Query Result) → GitHub Actions → PR Comment
 ```
 
-The diagram above shows the complete execution flow from GitHub, relaying through OSS to manage IacService Stacks. The interaction between OSS and IacService is fixed. The interaction from GitHub Actions to OSS is handled through workflows that manage code and trigger file uploads as well as execution log retrieval.
+The above diagram shows the complete operation link from GitHub to manage IacService stacks. The interaction between GitHub Actions and IacService is accomplished through workflows for code file upload, task triggering, and execution log retrieval.
 
-Workflows are triggered via PR comments, supporting the following commands:
+Workflows are triggered by PR comments and support the following commands:
 
 ```
 iac terraform plan [-profile=<profile>] [-stack=<stack>]
 iac terraform apply [-profile=<profile>] [-stack=<stack>]
 ```
 
-> **Auto-inference**: When a PR only contains changes in the `deployments/` directory, the `-profile` and `-stack` parameters can be omitted — the workflow will automatically infer them from the changed files. If the PR contains changes in other directories, both parameters must be specified manually.
+> **Auto-detection**: When a PR contains only changes to the `deployments/` directory, the `-profile` and `-stack` parameters can be omitted, and the workflow will automatically infer them from the changed files. If the PR contains changes to other directories, these parameters must be manually specified.
 
-The initialization scripts (`bootstrap/terraform-dev/`) create the following cloud resources:
+Auxiliary Scripts (`scripts/`):
 
-| Resource | Description |
-|----------|-------------|
-| **RAM Role** | Service role required by IacService to execute Terraform operations, default name `IaCServiceStackRole`. The example grants `AdministratorAccess` — **in production, follow the principle of least privilege and only grant RAM permissions required by the Terraform resources** |
-| **OSS Bucket** | Object storage bucket for code packages and trigger files, with versioning enabled and automatic cleanup of non-current versions after 30 days |
-| **MNS Topic/Queue/Subscription** | Message service topic, queue, and subscription for forwarding OSS events to the IacService message queue |
-| **OSS Event Rule** | Monitors creation and modification events of `.json` files in the Bucket to trigger MNS notifications |
-
-Helper scripts (`scripts/`):
-
-| Script | Language | Dependencies | Purpose |
-|--------|----------|-------------|---------|
-| `upload_to_oss.py` | Python 3.12 | `alibabacloud-oss-v2` | Uploads files to OSS. Supports version deduplication via `--unique_key` parameter (identical code is not re-uploaded). Reads credentials from environment variables `OSS_ACCESS_KEY_ID`/`OSS_ACCESS_KEY_SECRET`/`OSS_REGION`/`OSS_BUCKET` |
-| `parse_exec_result.py` | Python 3.12 | `alibabacloud-oss-v2`, `PyYAML` | Polls OSS for IacService execution result files, downloads and parses JSON into formatted Markdown tables. Supports multi-profile parallel polling (multi-threaded), default timeout 600 seconds |
+| Script | Language | Dependencies | Function |
+|--------|----------|--------------|----------|
+| `upload_iac_module.py` | Python 3.12 | `alibabacloud_iacservice20210806` | Calls IacService's `UploadModule` API to upload code packages to templates and publish as template versions |
+| `trigger_stack.py` | Python 3.12 | `alibabacloud_iacservice20210806` | Calls IacService's `TriggerStackExecution` API to trigger Stack execution |
+| `get_trigger_result.py` | Python 3.12 | `alibabacloud_iacservice20210806`, `PyYAML` | Polls IacService's `GetStackExecutionResult` API to retrieve results. Downloads, parses JSON, and formats as Markdown tables. Supports multi-profile parallel polling (multi-threading), default timeout 600 seconds |
 
 ---
 
 # Prerequisites
 
-## Initialize Cloud Infrastructure
+## Prepare Code Repository
 
-### 1. Prepare Code Repository
-
-Create a new repository on GitHub, copy all files from the `ci-templates/oss-mns-relay/github/` directory to your repository root, commit and push:
+Create a new repository in GitHub, copy all files from the `ci-templates/direct-iacservice/github/` directory of the IacService Stack multi-account management scaffold project to the root directory of your repository, then commit and push:
 
 ```bash
 git add .
@@ -75,52 +76,79 @@ git commit -m "init"
 git push --set-upstream origin main
 ```
 
-### 2. Create Temporary RAM User
+---
 
-Create an API-access-only RAM User in Alibaba Cloud, create an AK key pair, and grant the following permissions:
-- `AliyunRAMFullAccess`
-- `AliyunMNSFullAccess`
-- `AliyunOSSFullAccess`
+## Initialize Cloud Infrastructure
 
-Configure this AK in local environment variables (can be deleted after initialization):
+### 1. Create RAM User 1: Management User
 
-```bash
-export ALICLOUD_ACCESS_KEY="xxx"
-export ALICLOUD_SECRET_KEY="xxx"
+Used for one-time initialization configuration of IacService resources. Subsequent operations can be performed by operations personnel using this user account:
+
+1. Log in to the [RAM Console](https://ram.console.aliyun.com/), create a user and enable [OpenAPI Access]
+2. Attach the following policies to the user:
+   - `AliyunRAMFullAccess`
+   - Custom policy `IaCServiceStackFullAccess` (policy content see [docs/iam-policies.md](../../../docs/iam-policies.md))
+
+### 2. Create RAM User 2: Pipeline Trigger User
+
+Used for GitHub Actions to call IacService API. Configure the AccessKey to GitHub Secrets:
+
+1. Create a user and enable [OpenAPI Access]
+2. Attach custom policy `IaCServiceStackTriggerAccess` (policy content see [docs/iam-policies.md](../../../docs/iam-policies.md))
+3. Create an AccessKey, record the AccessKey ID and Secret for later GitHub Secrets configuration (this document uses development environment as an example, assuming the key pair is named `DEV_ACCESS_KEY_ID` / `DEV_ACCESS_KEY_SECRET`)
+
+### 3. Create RAM Role: IacService Execution Role
+
+Used to authorize IacService to assume this role to execute Terraform templates:
+
+1. Create a new RAM role in the RAM console
+2. Configure the trust policy to allow IacService to assume this role (trust policy content see [docs/iam-policies.md](../../../docs/iam-policies.md))
+3. Attach the permission policies required to execute Terraform templates (e.g., if the template contains ECS instances, attach ECS-related permissions)
+
+> **Multi-Environment Note**: If you have multiple environments (dev, staging, prod, etc.), it is recommended to create different RAM Roles to achieve complete isolation between environments.
+
+### 4. Create IacService Template
+
+This step creates the IacService template. A template corresponds to a piece of code. Each code modification needs to be republished as a new version. Different changes to the same code correspond to different template versions.
+
+> **Important**: Please record the template ID (ModuleId) after creation, as it will be needed in subsequent steps.
+
+**Step 1: Create New Template**
+
+Log in to [Alibaba Cloud IacService](https://iac.console.aliyun.com/), click [Template Management], and select [Create Template].
+
+**Step 2: Select Template Source**
+
+Select [Blank Template] method.
+
+**Step 3: Fill in Template Parameters**
+
+Fill in the following parameters and click [Submit]:
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| Template Name | Yes | The name of the template, must be unique |
+| Template Description | No | Description of the template |
+| Add to Project Group | No | Optional project group for unified template management |
+| Tags | No | Tags for the template for easier classification |
+
+Fill the created `moduleId` into the `code_module_id` value in `deployments/[env]/profile.yaml`:
+
+```yaml
+code_module_id: "mod-xxx"
 ```
 
-### 3. Execute Terraform Initialization
-
-```bash
-cd bootstrap/terraform-dev
-terraform init
-terraform plan
-terraform apply
-```
-
-After initialization, `outputs.tf` outputs the following:
-- `oss_bucket`: OSS Bucket name
-- `oss_region`: Bucket region
-- `ram_role_arn`: RAM Role ARN
-
-> **Optional Configuration**: To modify the OSS Bucket name or RAM Role name, edit the corresponding variables in `bootstrap/terraform-dev/variables.tf`. Default values are:
-> - OSS Bucket: `iac-stack-dev-` + random number
-> - RAM Role: `IaCServiceStackRole`
-
-### 4. Cleanup and Configuration
-
-- Delete the temporary AK and associated RAM User
-- Fill in the `oss_bucket` and `oss_region` from initialization output into `deployments/[env]/profile.yaml`
-
-> **Multi-Environment Note**: For multiple environments (dev, staging, prod, etc.), each environment requires an independent bootstrap configuration with different RAM Roles and OSS Buckets for complete environment isolation. See [Multi-Environment Configuration](#multi-environment-configuration).
+> **Multi-Environment Note**: If you have multiple environments (dev, staging, prod, etc.), you need to perform independent configuration for each environment using different IacService templates to achieve complete isolation between environments.
 
 ---
 
 ## GitHub Configuration
 
-### 1. Create RAM User and Configure OSS Permissions
+### 1. Create RAM User and Configure IacService Permissions
 
-Create an API-access-only RAM User, create an AK, and grant the following minimum permissions (replace `Mybucket` with the actual Bucket name):
+> **Note**: If you have already created a "Pipeline Trigger User" in the "Initialize Cloud Infrastructure" step, you can directly use that user's AccessKey and skip this step.
+
+Create a RAM User that only allows API access, create an AccessKey, and grant the following minimum permissions:
 
 ```json
 {
@@ -128,16 +156,16 @@ Create an API-access-only RAM User, create an AK, and grant the following minimu
   "Statement": [
     {
       "Effect": "Allow",
+      "Action": "iacservice:UploadModule",
+      "Resource": "acs:iacservice:*:*:module/*"
+    },
+    {
+      "Effect": "Allow",
       "Action": [
-        "oss:PutObject",
-        "oss:GetObject",
-        "oss:GetObjectVersion",
-        "oss:ListObjectVersions"
+        "iacservice:GetStackExecutionResult",
+        "iacservice:TriggerStackExecution"
       ],
-      "Resource": [
-        "acs:oss:*:*:Mybucket",
-        "acs:oss:*:*:Mybucket/*"
-      ]
+      "Resource": "acs:iacservice:*:*:stack/*"
     }
   ]
 }
@@ -145,18 +173,18 @@ Create an API-access-only RAM User, create an AK, and grant the following minimu
 
 ### 2. Configure GitHub Secrets
 
-Add the AK to the GitHub repository's Secrets, storing each Key and Value separately. The Key name corresponds to the key pair name configured in `profile.yaml`:
+Add the AccessKey to the GitHub repository Secrets, storing each Key and Value separately. The Key name should correspond to the key pair name configured in `profile.yaml`:
 
 | Secrets Key | Secrets Value |
 |-------------|---------------|
 | `DEV_ACCESS_KEY_ID` | `"xxx"` |
 | `DEV_ACCESS_KEY_SECRET` | `"xxx"` |
 
-> For multiple environments, configure with environment prefixes, e.g., `STAGING_ACCESS_KEY_ID`, `STAGING_ACCESS_KEY_SECRET`, `PROD_ACCESS_KEY_ID`, `PROD_ACCESS_KEY_SECRET`
+> If you have multiple environments, configure them by environment prefix, e.g., `STAGING_ACCESS_KEY_ID`, `STAGING_ACCESS_KEY_SECRET`, `PROD_ACCESS_KEY_ID`, `PROD_ACCESS_KEY_SECRET`
 
 ### 3. Declare Workflow Environment Variables
 
-In `.github/workflows/pull-request-comment.yml` and `scheduled-check.yml`, declare Secrets references in the `env` block:
+Declare Secrets references in the `env` block of `.github/workflows/pull-request-comment.yml` and `scheduled-check.yml`:
 
 ```yaml
 env:
@@ -165,71 +193,90 @@ env:
   # Other environments...
 ```
 
-> **Note**: All workflow files (including shared workflows) that use hardcoded environment prefixes must also have the corresponding Secrets references added.
+> **Note**: All workflow files (including shared workflows) that use hardcoded environment prefixes (e.g., `DEV_`, `PROD_`) must also add corresponding Secrets references.
 
-### 4. Initialize OSS
+### 4. Initialize IacService Template
 
-Commit the current branch code and manually trigger the **Scheduled Check** workflow in GitHub Actions to initialize OSS (select the current branch before running, no need to check "Whether to run detect check").
+Submit the current branch code and manually trigger the **Scheduled Check** workflow in GitHub Actions to initialize the IacService template (select the current branch before running, no need to check "Whether to run detect check").
 
-> If the run fails, it may be because multiple environments exist under `deployments/` but are not fully configured. Delete extra environment directories or complete their configuration.
+> If an error occurs, it may be because multiple environments exist under `deployments/` but not all are configured. Delete extra environment directories or complete the configuration.
 
 ---
 
 # GitHub Actions Workflow Configuration
 
-The repository contains 5 workflow files in two categories:
+The repository contains 5 workflow files, divided into two categories:
 
 ## Workflow Files
 
-**Main workflows** (triggered directly by GitHub events):
+**Main Workflows** (directly triggered by GitHub events):
 
-| Workflow | Trigger | Purpose |
-|----------|---------|---------|
+| Workflow | Trigger | Function |
+|----------|---------|----------|
 | `pull-request-comment.yml` | PR comment created/edited | Parses `iac terraform plan/apply` commands, packages and uploads code, triggers IacService execution, writes results back to PR |
-| `scheduled-check.yml` | Manual trigger / scheduled | Uploads source packages for all environments to OSS, optionally triggers drift detection |
+| `scheduled-check.yml` | Manual trigger / Scheduled task | Uploads source packages for all environments to IacService template and publishes as versions, optionally triggers drift detection |
 
-**Shared workflows** (called by main workflows, can be extracted for reuse):
+**Shared Workflows** (called by main workflows, can be independently extracted and reused):
 
-| Workflow | Caller | Purpose |
-|----------|--------|---------|
+| Workflow | Caller | Function |
+|----------|--------|----------|
 | `shared-ci-get-pull-request-info.yml` | `pull-request-comment` | Validates PR mergeability, parses `-profile`/`-stack` parameters from comments, auto-infers affected stacks from changed files |
-| `shared-ci-upload-source-package.yml` | `scheduled-check` | Iterates all profiles, runs `make build-package` to build source packages and upload to OSS; single profile failure does not affect others |
-| `shared-ci-upload-trigger-file.yml` | `pull-request-comment` | Builds source packages for each profile, creates trigger files containing execution commands and changed stacks, uploads to OSS; any failure terminates immediately |
+| `shared-ci-upload-source-package.yml` | `scheduled-check` | Iterates through all profiles, executes `make build-package` to build source packages and upload to IacService template versions; single profile failure doesn't affect others |
+| `shared-ci-upload-trigger-file.yml` | `pull-request-comment` | Builds source packages for each profile, calls IacService API with execution commands and changed stacks to trigger execution; fails fast on any profile failure |
 
 ## Workflow Dependencies
 
 ```
 pull-request-comment.yml
 ├── shared-ci-get-pull-request-info.yml    # Step 1: Parse commands, get PR info
-├── shared-ci-upload-trigger-file.yml      # Step 2: Package and upload code + trigger files
-└── get_exec_result (inline job)           # Step 3: Poll results → write back to PR Comment
+├── shared-ci-upload-trigger-file.yml      # Step 2: Upload code as template version + Trigger execution
+└── get_exec_result (inline job)            # Step 3: Poll results → Write back to PR Comment
 
 scheduled-check.yml
-├── shared-ci-upload-source-package.yml    # Step 1: Upload source packages for all profiles
-└── get_exec_result (inline job)           # Step 2: Poll detection results (only when run_detect=true)
+├── shared-ci-upload-source-package.yml    # Step 1: Upload all profile source packages
+└── get_exec_result (inline job)            # Step 2: Poll detection results (only when run_detect=true)
 ```
 
 ---
 
 # Daily Usage
 
-## Create IacService Stacks
+## Create IacService Stack
 
-Before executing code, you first need to create the corresponding Stacks on Alibaba Cloud IacService to host the code execution. After repository code initialization, first upload code to OSS via the Scheduled Check workflow, then create all corresponding Stacks at once on the IacService console.
+Before executing code, you need to create the corresponding stack on Alibaba Cloud IacService to host the code execution. After the repository code initialization is complete, first use the Scheduled Check workflow to upload the code as an IacService template version, then create the corresponding stack on IacService.
 
-Go to Alibaba Cloud IacService (https://iac.console.aliyun.com/stack) to create Stacks:
+Go to Alibaba Cloud IacService (https://iac.console.aliyun.com/stack) to create a Stack:
 
-- **Stack Name**: Recommended to match the module directory name under `stacks/`
-- **OSS Bucket**: Select from the dropdown (created by bootstrap initialization)
-- **OSS Object**: Select the OSS Object path for the corresponding environment
-- **RAM Role**: Select from the dropdown (created by bootstrap initialization)
-- **Working Directory**: Fill in the stack's relative path, e.g., `stacks/demo`
+**Step 1: Create Stack**
 
-> **Batch Creation**: It is recommended to create all Stacks defined under the `stacks/` directory at once. Each Stack corresponds to an independent resource stack. After creation, an initial `plan` will be automatically executed to verify configuration correctness.
+Click [Stack], select [Create Stack].
 
-## Change Workflow
+**Step 2: Fill in Stack Information**
 
-1. Create a development branch, commit code changes, push to GitHub
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| Stack Name | Yes | The name of the stack, must be unique |
+| Description | No | Description of the stack |
+| Stack Code Source | Yes | **Module (Recommended)**: Select template from IacService<br>**OSS (Not Recommended)**: Code stored via OSS (more dependencies, complex) |
+| Template ID/Version | Yes | Select the template created in Prerequisites |
+| Working Directory | Yes | The path where the stack configuration file is stored in the code |
+| RAM Role | Yes | Select the role created in Prerequisites for running Terraform templates |
+
+**Step 3: Associate Parameter Set**
+
+Select or create a parameter set, click [Next].
+
+**Step 4: Confirm Creation**
+
+After checking the configuration information is correct, click [Create].
+
+> **Batch Creation**: It is recommended to create all Stacks defined in the `stacks/` directory at once. Each Stack corresponds to an independent stack. After creation, the first `plan` will be automatically executed to verify the correctness of the configuration.
+
+---
+
+## Change Process
+
+1. **Create a development branch, submit code changes, and push to GitHub**
 
 ```bash
 git checkout -b dev
@@ -239,38 +286,41 @@ git commit -m "update stack config"
 git push --set-upstream origin dev
 ```
 
-2. Create a PR to the main branch (e.g., `main`), enter commands in PR comments to trigger deployment:
+2. **Create a PR to the main branch (e.g., `main`), and enter commands in the PR comment to trigger deployment**
 
 ```bash
 iac terraform plan -profile=dev -stack=demo
 iac terraform apply -profile=dev -stack=demo
 ```
 
-3. Execution results are automatically written back to PR comments — confirm apply results meet expectations
-4. After review approval, merge changes to the main branch
+3. **The execution result will be automatically written back to the PR comment. Confirm that the apply result meets expectations**
 
-## Runtime Parameter Reference
+4. **After review approval, merge the changes to the main branch**
 
-Runtime parameters are passed via PR comments in the following format:
+---
+
+## Running Parameters
+
+Pass running parameters through PR comments in the following format:
 
 ```
 iac terraform plan/apply [-profile=<profileName>] [-stack=<StackName>]
 ```
 
-**Parameter Reference**:
+**Parameter Description**:
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
-| `-profile` | Yes* | Execution environment, corresponds to environment name under `deployments/` directory |
+| `-profile` | Yes* | Execution environment, corresponds to environment names under `deployments/` directory |
 | `-stack` | Yes* | Target stack path, supports directory nesting, e.g., `demo/subDir` |
 
-> *When a PR only contains changes in the `deployments/` directory, both parameters can be omitted — the workflow will auto-infer from changed files.
+> *When a PR contains only changes to the `deployments/` directory, these two parameters can be omitted, and the workflow will automatically infer them from the changed files.
 
 **Notes**:
 
-- A PR can be reused until merged, but creating independent PRs for each task is recommended for traceability
-- `plan` must be executed before each `apply`; `plan` can be executed multiple times consecutively
-- Different environment `-profile` values correspond to different Alibaba Cloud accounts and resources, with no mutual impact
+- A PR can be reused until it is merged and closed, but it is recommended to create independent PRs for each task for easier tracking
+- Execute `plan` before each `apply`; `plan` can be executed multiple times consecutively
+- Different environment `-profile` corresponds to different Alibaba Cloud accounts and resources, and they do not affect each other
 
 ---
 
@@ -278,91 +328,84 @@ iac terraform plan/apply [-profile=<profileName>] [-stack=<StackName>]
 
 ## Troubleshooting
 
-| Issue | Resolution |
-|-------|-----------|
-| No deployment response | Check if GitHub Secrets are configured correctly, if OSS/MNS services are operational, if RAM permissions are sufficient |
-| Command not recognized | Confirm PR Comment format is `iac terraform plan/apply`, note the prefix must match exactly |
-| `make build-package` fails | Confirm the repository root contains a Makefile with the `build-package` target |
-| Profile upload fails | Check if `access_key_id`/`access_key_secret` in `deployments/[env]/profile.yaml` match the Key names in GitHub Secrets |
-| Result retrieval timeout | Default polling timeout is 600 seconds, check IacService console to confirm if the Stack is executing |
-| Partial multi-environment failure | Check GitHub Actions logs, `shared-ci-upload-source-package` will list the failed profile names |
-| View detailed errors | Check GitHub Actions run logs, or inspect trigger and result files in OSS |
+| Issue | Troubleshooting Method |
+|-------|----------------------|
+| Deployment no response | Check if GitHub Secrets are configured correctly, if IacService is normal, and if RAM permissions are sufficient |
+| Command not recognized | Confirm PR Comment format is `iac terraform plan/apply`, prefix must match exactly |
+| `make build-package` failed | Confirm that Makefile exists in the repository root and contains `build-package` target |
+| Profile upload failed | Check if `access_key_id`/`access_key_secret` in `deployments/[env]/profile.yaml` match the Key names in GitHub Secrets |
+| Code upload failed | Check if `code_module_id` is correct and if the AK has IacService-related permissions |
+| Trigger execution failed | Check if `code_module_version` is correct and if the stack has been created |
+| Result retrieval timeout | Default polling timeout is 600 seconds; check IacService console to confirm if Stack is executing |
+| Multi-environment partial failure | Check GitHub Actions logs; `shared-ci-upload-source-package` will list failed profile names |
+| View detailed error information | Check GitHub Actions run logs, or check execution records in IacService console |
+
+---
 
 ## CI Dependencies
 
-GitHub Actions runtime requires the following dependencies:
+GitHub Actions requires the following dependencies at runtime:
 
-| Dependency | Purpose | Provisioning |
-|------------|---------|-------------|
-| **Python 3.12** | Running `upload_to_oss.py` and `parse_exec_result.py` scripts | Auto-installed via `actions/setup-python@v5` |
-| **alibabacloud-oss-v2** | Alibaba Cloud OSS SDK for uploading code packages and retrieving execution results | `pip install alibabacloud-oss-v2` |
-| **PyYAML** | Parsing `profile.yaml` and credential files | `pip install PyYAML` |
-| **make** | Running `make build-package` to build source packages | Pre-installed in `ubuntu-latest` image |
-| **curl / jq** | Fetching PR info, parsing JSON responses | Pre-installed in `ubuntu-latest` image |
+| Dependency | Purpose | Provision Method |
+|------------|---------|-----------------|
+| **Python 3.12** | Run `upload_iac_module.py`, `trigger_stack.py`, and `get_trigger_result.py` scripts | Automatically installed using `actions/setup-python@v5` |
+| **alibabacloud_iacservice20210806** | Alibaba Cloud IacService SDK for uploading code packages, triggering execution, and retrieving execution results | `pip install alibabacloud_iacservice20210806` |
+| **PyYAML** | Parse `profile.yaml` and credential files | `pip install PyYAML` |
+| **make** | Execute `make build-package` to build source packages | Pre-installed in `ubuntu-latest` image |
+| **curl / jq** | Get PR information, parse JSON responses | Pre-installed in `ubuntu-latest` image |
 
-> **Offline Environment Note**: If GitHub Actions runs on self-hosted Runners without public internet access, pre-install the above dependencies in the Runner image or cache dependency packages in a private repository/artifact store.
+> **Offline Environment Note**: If GitHub Actions runs on a self-hosted Runner without internet access, you need to pre-install the above dependencies in the Runner image, or cache dependency packages to a private repository/artifact repository.
+
+---
 
 ## Multi-Environment Configuration
 
-To add a new Alibaba Cloud account (e.g., adding a `test` environment), complete the following:
+If you need to add a new Alibaba Cloud account (e.g., add a `test` environment), complete the following configuration:
 
-### 1. Create Bootstrap Configuration
+### 1. Create RAM Role and IacService Template
 
-```bash
-mkdir -p bootstrap/terraform-test
-cp bootstrap/terraform-dev/*.tf bootstrap/terraform-test/
+Refer to [Create RAM Role](../../../docs/iam-policies.md) and [Create IacService Template](#4-create-iacservice-template) chapters to create independent RAM Role and template for the new environment.
 
-cd bootstrap/terraform-test
-
-# Modify bucket_name and ram_role_name in variables.tf to ensure they differ from other environments
-vim variables.tf
-
-terraform init
-terraform apply
-```
-
-> **Important**: Each environment must use an independent state file. Do not copy `*.tfstate` state files.
-
-### 2. Create Deployments Configuration
+### 2. Create deployments Configuration
 
 ```bash
 cp -r deployments/dev deployments/test
 cd deployments/test
 ```
 
-Modify `profile.yaml` to update `oss_bucket`, `oss_region`, and `account_id` to the values from step 1 output, and change the AK variable names in `profile.yaml` to the new GitHub Secrets keys.
+Modify `code_module_id` in `profile.yaml` to the `moduleId` from Step 1, and add the AK variable name in `profile.yaml` as a new GitHub Secrets Key.
 
 ### 3. Configure GitHub Secrets
 
-In GitHub repository Settings → Secrets and variables → Actions, add:
+Add the new account in GitHub repository Settings → Secrets and variables → Actions:
 
 | Secrets Key | Secrets Value |
 |-------------|---------------|
-| `TEST_ACCESS_KEY_ID` | New account AccessKey ID |
-| `TEST_ACCESS_KEY_SECRET` | New account AccessKey Secret |
+| `TEST_ACCESS_KEY_ID` | New account's AccessKey ID |
+| `TEST_ACCESS_KEY_SECRET` | New account's AccessKey Secret |
 
 ### 4. Declare CI Environment Variables
 
-In `.github/workflows/pull-request-comment.yml` and `scheduled-check.yml`, add references for the new account in the `env` block:
+Add the new account reference in the `env` block of `.github/workflows/pull-request-comment.yml` and `scheduled-check.yml`:
 
 ```yaml
 env:
-  # ... other environments
+  # ... Other environments
   TEST_ACCESS_KEY_ID: ${{ secrets.TEST_ACCESS_KEY_ID }}
   TEST_ACCESS_KEY_SECRET: ${{ secrets.TEST_ACCESS_KEY_SECRET }}
 ```
 
-> **Note**: All workflow files (including shared workflows) that use hardcoded environment prefixes (e.g., `DEV_`, `PROD_`) must also have `TEST_` references added.
+> **Note**: All workflow files (including shared workflows) that use hardcoded environment prefixes (e.g., `DEV_`, `PROD_`) must also add corresponding `TEST_` references.
 
 ### 5. Create Stack
 
-Go to the Alibaba Cloud IaC console to create Stacks, selecting the OSS Bucket and RAM Role created in step 1. Refer to the [Create IacService Stacks](#create-iac-service-stacks) section.
+Go to Alibaba Cloud Iac console to create a Stack, selecting the `moduleId` and RAM Role created in Step 1. Refer to [Create IacService Stack](#create-iacservice-stack) chapter.
 
 ### 6. Verify Configuration
 
-After committing the configuration, manually trigger the **Scheduled Check** workflow to confirm the new environment's source package uploads successfully.
+After submitting the configuration, manually trigger the **Scheduled Check** workflow to confirm that the new environment's source package upload is successful.
 
-> **Account Isolation Recommendation**: Each Alibaba Cloud account should have independent RAM Roles, OSS Buckets, and MNS resources, with credentials managed through separate GitHub Secrets for complete isolation. It is recommended to allocate different environments to different Alibaba Cloud master accounts and manage them centrally through Alibaba Cloud Resource Directory.
+> **Account Isolation Recommendation**: Each Alibaba Cloud account corresponds to independent RAM Role and IacService template resources. Manage credentials through different GitHub Secrets to achieve complete isolation. It is recommended to divide different environments into different Alibaba Cloud master accounts and use Alibaba Cloud Resource Directory for unified governance.
 
 ---
 
@@ -372,66 +415,65 @@ After committing the configuration, manually trigger the **Scheduled Check** wor
 
 ### pull-request-comment.yml
 
-**Trigger**: PR comment created or edited (`issue_comment: [created, edited]`)
+**Trigger Condition**: When a PR comment is created or edited (`issue_comment: [created, edited]`)
 
-**Flow**:
+**Workflow**:
 
-1. **get_trigger_info** — Calls `shared-ci-get-pull-request-info.yml`, parses commands from comments, gets PR head SHA and base ref, infers affected stacks
-2. **process_trigger_file** — Calls `shared-ci-upload-trigger-file.yml`, packages code and uploads trigger files to OSS
-3. **get_exec_result** — Polls OSS for execution results, formats and writes back to PR comment
+1. **get_trigger_info** — Calls `shared-ci-get-pull-request-info.yml` to parse commands in comments, get PR head SHA and base ref, infer affected stacks
+2. **process_trigger_file** — Calls `shared-ci-upload-trigger-file.yml` to package code and upload to IacService template, trigger execution
+3. **get_exec_result** — Polls IacService API to get execution results, formats and writes back to PR comment
 
-**Supported command formats**:
+**Supported Command Format**:
 
 ```
 iac terraform plan [-profile=<profile>] [-stack=<stack>]
 iac terraform apply [-profile=<profile>] [-stack=<stack>]
 ```
 
-> When a PR only contains changes in the `deployments/` directory, the workflow auto-infers profiles and stacks from changed files, making `-profile` and `-stack` optional. If the PR contains changes in other directories, both parameters must be specified manually.
+> When a PR contains only changes to the `deployments/` directory, the workflow will automatically infer profiles and stacks from the changed files. At this time, `-profile` and `-stack` parameters are optional. If the PR contains changes to other directories, these parameters must be manually specified.
 
 ### scheduled-check.yml
 
-**Trigger**: Manual trigger (`workflow_dispatch`) or scheduled run
+**Trigger Condition**: Manually triggered (`workflow_dispatch`) or scheduled to run automatically
 
-**Flow**:
+**Workflow**:
 
-1. **process_code** — Calls `shared-ci-upload-source-package.yml`, processes source package uploads for all profiles (`profiles: all`); if `run_detect` is enabled, also creates detection trigger files
-2. **get_exec_result** — Only executes when `run_detect=true` or on scheduled triggers, fetches and outputs execution results
+1. **process_code** — Calls `shared-ci-upload-source-package.yml` to process source package uploads for all profiles (`profiles: all`); if `run_detect` is enabled, additionally triggers detection
+2. **get_exec_result** — Executes only when `run_detect=true` or scheduled trigger, gets and outputs execution results
 
-**Primary uses**:
+**Main Purposes**:
 
-- **Drift Detection**: Triggered via `run_detect=true`, automatically detects drift between actual cloud resources and Terraform configurations
-- **Source Package Initialization**: Uploads source packages to OSS during initial setup, preparing for PR deployments
-- **Code Integrity Verification**: Periodically verifies that all environments' code can build successfully
+- **Drift Detection**: Triggered by `run_detect=true`, automatically detects deviations between actual cloud resources and Terraform configurations
+- **Source Package Initialization**: Uploads source packages to IacService template during initial configuration, preparing for PR deployment
+- **Code Integrity Verification**: Periodically verifies that code for all environments can be built normally
 
-> **Code Source**: Uploads code from the `main` branch by default. Drift detection compares cloud resource state against `main` branch configurations, generating detection reports when drift is found.
+> **Code Source**: By default, uploads code from the `main` branch. Drift detection compares cloud resource status with `main` branch configuration and generates a detection report if deviations are found.
 
 ### Shared Workflows
 
 **shared-ci-get-pull-request-info.yml**
 
-Retrieves PR details and parses command parameters. Main functions: validates PR mergeability, extracts head SHA and base ref, parses `-profile`/`-stack` parameters, auto-infers affected stacks from changed files.
+Gets detailed PR information and parses command parameters. Main functions: validate PR mergeability, extract head SHA and base ref, parse `-profile`/`-stack` parameters, auto-infer affected stacks from changed files.
 
 Main outputs: `command`, `base_ref`, `head_sha`, `all_changed_stacks`
 
 **shared-ci-upload-source-package.yml**
 
-Builds source packages and uploads to OSS, supporting multi-profile batch processing. Runs `make build-package PROFILE=<profile>` for each profile to build code packages, uploads via `upload_to_oss.py`. Single profile failure does not affect others; all failures are summarized after completion.
+Builds source packages and uploads them to IacService template, supporting multi-profile batch processing. Executes `make build-package PROFILE=<profile>` for each profile to build code packages, uploads to IacService template via `upload_iac_module.py`. Single profile failure does not affect other profiles; failure information is summarized after all processing is complete.
 
 **shared-ci-upload-trigger-file.yml**
 
-Uploads source packages and trigger files to OSS, initiating IacService execution. Parses the `all_changed_stacks` parameter, creates trigger files (JSON format) for each profile containing execution commands, code paths, and changed stacks. Uses a fail-fast strategy — any profile failure terminates immediately.
+Uploads source packages to IacService template and triggers execution API to start IacService execution. Parses `all_changed_stacks` parameters and performs the following operations for each profile:
 
-Trigger file structure example:
+1. Build source package
+2. Call `upload_iac_module.py` to upload to IacService template, get `version_id`
+3. Call `trigger_stack.py` to trigger Plan or Apply execution, get `trigger_id`
 
-```json
-{
-  "id": "PR123-[user]-1",
-  "action": "terraform plan",
-  "codeHeadSha": "abc123...",
-  "codeVersionId": "v1",
-  "codePackagePath": "oss::https://bucket.oss-cn-beijing.aliyuncs.com/repositories/org/repo/main/code.zip",
-  "execResultPath": "oss::https://bucket.oss-cn-beijing.aliyuncs.com/notifications/org/repo/main/PR123-[user]-1.json",
-  "changedFolders": "stacks/demo/"
-}
+Uses fail-fast strategy; immediately terminates on any profile failure.
+
+Trigger information example:
+
+```
+Profile: dev, Version ID: v123456
+Profile: dev, Trigger ID: trg-abc123...
 ```

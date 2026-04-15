@@ -54,13 +54,13 @@ iac terraform apply [-profile=<profile>] [-stack=<stack>]
 
 > **Auto-detection**: When a PR contains only changes to the `deployments/` directory, the `-profile` and `-stack` parameters can be omitted, and the workflow will automatically infer them from the changed files. If the PR contains changes to other directories, these parameters must be manually specified.
 
-Auxiliary Scripts (`scripts/`):
+Helper scripts (`scripts/`):
 
-| Script | Language | Dependencies | Function |
-|--------|----------|--------------|----------|
-| `upload_iac_module.py` | Python 3.12 | `alibabacloud_iacservice20210806` | Calls IacService's `UploadModule` API to upload code packages to templates and publish as template versions |
-| `trigger_stack.py` | Python 3.12 | `alibabacloud_iacservice20210806` | Calls IacService's `TriggerStackExecution` API to trigger Stack execution |
-| `get_trigger_result.py` | Python 3.12 | `alibabacloud_iacservice20210806`, `PyYAML` | Polls IacService's `GetStackExecutionResult` API to retrieve results. Downloads, parses JSON, and formats as Markdown tables. Supports multi-profile parallel polling (multi-threading), default timeout 600 seconds |
+| Script | Language | Dependencies | Purpose |
+|--------|----------|--------------|---------|
+| `upload_iac_module.py` | Python 3.12 | `alibabacloud_iacservice20210806` | Packages and uploads code to IacService module. Reads credentials and configuration from environment variables `IAC_ACCESS_KEY_ID`/`IAC_ACCESS_KEY_SECRET`/`IAC_REGION`/`CODE_MODULE_ID` |
+| `trigger_stack.py` | Python 3.12 | `alibabacloud_iacservice20210806` | Triggers Plan or Apply operations on a Stack, returns Trigger ID for subsequent queries |
+| `get_trigger_result.py` | Python 3.12 | `alibabacloud_iacservice20210806`, `PyYAML` | Polls IacService API for execution results with formatted output. Supports multi-profile parallel polling (multi-threaded), default timeout 600 seconds |
 
 ---
 
@@ -274,9 +274,9 @@ After checking the configuration information is correct, click [Create].
 
 ---
 
-## Change Process
+## Change Workflow
 
-1. **Create a development branch, submit code changes, and push to GitHub**
+1. Create a development branch, commit code changes, push to GitHub
 
 ```bash
 git checkout -b dev
@@ -286,41 +286,41 @@ git commit -m "update stack config"
 git push --set-upstream origin dev
 ```
 
-2. **Create a PR to the main branch (e.g., `main`), and enter commands in the PR comment to trigger deployment**
+2. Create a PR to the main branch (e.g., `main`), enter commands in PR comments to trigger deployment:
 
 ```bash
 iac terraform plan -profile=dev -stack=demo
 iac terraform apply -profile=dev -stack=demo
 ```
 
-3. **The execution result will be automatically written back to the PR comment. Confirm that the apply result meets expectations**
+3. Execution results are automatically written back to PR comments — confirm apply results meet expectations
 
-4. **After review approval, merge the changes to the main branch**
+4. After review approval, merge changes to the main branch
 
 ---
 
-## Running Parameters
+## Runtime Parameter Reference
 
-Pass running parameters through PR comments in the following format:
+Runtime parameters are passed via PR comments in the following format:
 
 ```
 iac terraform plan/apply [-profile=<profileName>] [-stack=<StackName>]
 ```
 
-**Parameter Description**:
+**Parameter Reference**:
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
-| `-profile` | Yes* | Execution environment, corresponds to environment names under `deployments/` directory |
+| `-profile` | Yes* | Execution environment, corresponds to environment name under `deployments/` directory |
 | `-stack` | Yes* | Target stack path, supports directory nesting, e.g., `demo/subDir` |
 
-> *When a PR contains only changes to the `deployments/` directory, these two parameters can be omitted, and the workflow will automatically infer them from the changed files.
+> *When a PR only contains changes in the `deployments/` directory, both parameters can be omitted — the workflow will auto-infer from changed files.
 
 **Notes**:
 
-- A PR can be reused until it is merged and closed, but it is recommended to create independent PRs for each task for easier tracking
-- Execute `plan` before each `apply`; `plan` can be executed multiple times consecutively
-- Different environment `-profile` corresponds to different Alibaba Cloud accounts and resources, and they do not affect each other
+- A PR can be reused until merged, but creating independent PRs for each task is recommended for traceability
+- `plan` must be executed before each `apply`; `plan` can be executed multiple times consecutively
+- Different environment `-profile` values correspond to different Alibaba Cloud accounts and resources, with no mutual impact
 
 ---
 
@@ -328,33 +328,33 @@ iac terraform plan/apply [-profile=<profileName>] [-stack=<StackName>]
 
 ## Troubleshooting
 
-| Issue | Troubleshooting Method |
-|-------|----------------------|
-| Deployment no response | Check if GitHub Secrets are configured correctly, if IacService is normal, and if RAM permissions are sufficient |
-| Command not recognized | Confirm PR Comment format is `iac terraform plan/apply`, prefix must match exactly |
-| `make build-package` failed | Confirm that Makefile exists in the repository root and contains `build-package` target |
-| Profile upload failed | Check if `access_key_id`/`access_key_secret` in `deployments/[env]/profile.yaml` match the Key names in GitHub Secrets |
-| Code upload failed | Check if `code_module_id` is correct and if the AK has IacService-related permissions |
-| Trigger execution failed | Check if `code_module_version` is correct and if the stack has been created |
-| Result retrieval timeout | Default polling timeout is 600 seconds; check IacService console to confirm if Stack is executing |
-| Multi-environment partial failure | Check GitHub Actions logs; `shared-ci-upload-source-package` will list failed profile names |
-| View detailed error information | Check GitHub Actions run logs, or check execution records in IacService console |
+| Issue | Resolution |
+|-------|-----------|
+| No deployment response | Check if GitHub Secrets are configured correctly, if IacService is operational, if RAM permissions are sufficient |
+| Command not recognized | Confirm PR Comment format is `iac terraform plan/apply`, note the prefix must match exactly |
+| `make build-package` fails | Confirm the repository root contains a Makefile with the `build-package` target |
+| Profile upload fails | Check if `access_key_id`/`access_key_secret` in `deployments/[env]/profile.yaml` match the Key names in GitHub Secrets |
+| Code upload fails | Check if `code_module_id` is correct, if AK has IacService permissions |
+| Trigger execution fails | Check if `code_module_version` is correct, if the Stack has been created |
+| Result retrieval timeout | Default polling timeout is 600 seconds, check IacService console to confirm if the Stack is executing |
+| Partial multi-environment failure | Check GitHub Actions logs, `shared-ci-upload-source-package` will list the failed profile names |
+| View detailed errors | Check GitHub Actions run logs, or check execution records in IacService console |
 
 ---
 
 ## CI Dependencies
 
-GitHub Actions requires the following dependencies at runtime:
+GitHub Actions runtime requires the following dependencies:
 
-| Dependency | Purpose | Provision Method |
-|------------|---------|-----------------|
-| **Python 3.12** | Run `upload_iac_module.py`, `trigger_stack.py`, and `get_trigger_result.py` scripts | Automatically installed using `actions/setup-python@v5` |
+| Dependency | Purpose | Provisioning |
+|------------|---------|-------------|
+| **Python 3.12** | Running `upload_iac_module.py`, `trigger_stack.py`, and `get_trigger_result.py` scripts | Auto-installed via `actions/setup-python@v5` |
 | **alibabacloud_iacservice20210806** | Alibaba Cloud IacService SDK for uploading code packages, triggering execution, and retrieving execution results | `pip install alibabacloud_iacservice20210806` |
-| **PyYAML** | Parse `profile.yaml` and credential files | `pip install PyYAML` |
-| **make** | Execute `make build-package` to build source packages | Pre-installed in `ubuntu-latest` image |
-| **curl / jq** | Get PR information, parse JSON responses | Pre-installed in `ubuntu-latest` image |
+| **PyYAML** | Parsing `profile.yaml` and credential files | `pip install PyYAML` |
+| **make** | Running `make build-package` to build source packages | Pre-installed in `ubuntu-latest` image |
+| **curl / jq** | Fetching PR info, parsing JSON responses | Pre-installed in `ubuntu-latest` image |
 
-> **Offline Environment Note**: If GitHub Actions runs on a self-hosted Runner without internet access, you need to pre-install the above dependencies in the Runner image, or cache dependency packages to a private repository/artifact repository.
+> **Offline Environment Note**: If GitHub Actions runs on self-hosted Runners without public internet access, pre-install the above dependencies in the Runner image or cache dependency packages in a private repository/artifact store.
 
 ---
 

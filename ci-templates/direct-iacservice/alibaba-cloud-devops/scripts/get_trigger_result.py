@@ -223,6 +223,7 @@ def format_execution_result(data: Dict[str, Any]) -> str:
                             "Planned": "✅",
                             "PlannedAndFinished": "✅",
                             "DetectInProgress": "✅",
+                            "ConfigProactiveSuccess": "✅",
                             "Errored": "❌"
                         }.get(deploy_status, "⚪")
 

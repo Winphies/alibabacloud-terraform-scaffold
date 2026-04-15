@@ -1,5 +1,5 @@
 # .github/workflows/shared-ci-upload-source-package.yml
-name: Upload Source Package to OSS
+name: Upload Source Package to IaCService
 
 on:
   workflow_call:
@@ -21,7 +21,7 @@ on:
         required: false
         type: string
         description: "YAML string representing a map of secrets to be used in the workflow"
-      
+
     outputs:
       result_path:
         description: "The log path of the execution result"
@@ -45,7 +45,7 @@ jobs:
           path: governance
           ref: main
           sparse-checkout: |
-            scripts/upload_to_oss.py
+            scripts/upload_iac_module.py
 
       - name: Setup Python environment
         uses: actions/setup-python@v4
@@ -55,10 +55,9 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install alibabacloud-oss-v2
-          # Install PyYAML if not already installed
+          pip install alibabacloud_iacservice20210806==2.6.1
           pip install PyYAML
-      
+
       - name: Process secrets map
         if: ${{ inputs.secrets_map != '' }}
         run: |
@@ -71,9 +70,9 @@ jobs:
             echo "$line" >> $GITHUB_ENV
           done
 
-      - name: Create source package and Upload to OSS
+      - name: Create source package and Upload to IaCService
         id: upload_and_trigger
-        env: 
+        env:
           DEV_ACCESS_KEY_ID: ${{ secrets.DEV_ACCESS_KEY_ID }}
           DEV_ACCESS_KEY_SECRET: ${{ secrets.DEV_ACCESS_KEY_SECRET }}
           PROD_ACCESS_KEY_ID: ${{ secrets.PROD_ACCESS_KEY_ID }}
@@ -82,7 +81,7 @@ jobs:
           STAGING_ACCESS_KEY_SECRET: ${{ secrets.STAGING_ACCESS_KEY_SECRET }}
         run: |
           echo "Creating source package..."
-
+          
           # Make yq script executable
           chmod +x governance/scripts/yaml_parser.py
           chmod +x governance/scripts/yq
@@ -139,7 +138,7 @@ jobs:
             fi
             hash=$(echo "$make_output" | grep -o "Hash: [a-f0-9]*" | awk '{print $2}')
           
-
+          
             profile_file="stacks/profile.yaml"
             # Check if profile file exists
             if [ ! -f "$profile_file" ]; then
@@ -148,8 +147,8 @@ jobs:
               continue
             fi
 
-            oss_region="cn-beijing"
-            oss_bucket=$(yq '.oss_bucket' "$profile_file")
+            iac_region="cn-zhangjiakou"
+            code_module_id=$(yq '.code_module_id' "$profile_file")
             access_key_id_name=$(yq '.access_key_id' "$profile_file")
             access_key_secret_name=$(yq '.access_key_secret' "$profile_file")
 
@@ -162,27 +161,23 @@ jobs:
               failed_profiles+=("$profile")
               continue
             fi
-            export OSS_BUCKET=$oss_bucket OSS_REGION=$oss_region OSS_ACCESS_KEY_ID=$access_key_id OSS_ACCESS_KEY_SECRET=$access_key_secret
-        
-           
+            export IAC_REGION=$iac_region IAC_ACCESS_KEY_ID=$access_key_id IAC_ACCESS_KEY_SECRET=$access_key_secret CODE_MODULE_ID=$code_module_id
+          
+          
             mv $codeDir.zip ../
             cd ../
             ls -all *.zip
-            
-            object_path="repositories/${{ github.repository }}/${{ inputs.base_ref }}"
-            code_path="${object_path}/code.zip"
 
-
-            echo "Uploading to OSS with key: $code_path"
+            echo "Uploading to IaCService module: $code_module_id"
             # Use tee to display output in real-time while capturing it
             output_file=$(mktemp)
-            python governance/scripts/upload_to_oss.py --key="$code_path" --file_path=$codeDir.zip --unique_key="$hash" 2>&1 | tee "$output_file"
+            python governance/scripts/upload_iac_module.py --region=$iac_region --code_module_id=$code_module_id --file_path=$codeDir.zip 2>&1 | tee "$output_file"
             upload_exit_code=${PIPESTATUS[0]}
             output=$(cat "$output_file")
             rm -f "$output_file"
 
             if [ $upload_exit_code -ne 0 ]; then
-              echo "Error: Failed to upload to OSS for profile: $profile (exit code: $upload_exit_code)"
+              echo "Error: Failed to upload to IaCService for profile: $profile (exit code: $upload_exit_code)"
               echo "Skipping remaining steps for profile: $profile, continuing with next profile..."
               failed_profiles+=("$profile")
               continue
@@ -195,44 +190,34 @@ jobs:
               version_id=""
             fi
 
-            # Create and upload trigger file if run_detect is true
+            # Create and trigger detect if run_detect is true
             if [ "${{ inputs.run_detect }}" == "true" ]; then
-              echo "Creating detect trigger file for profile: $profile"
-              
-              oss_path="oss::https://${oss_bucket}.oss-${oss_region}.aliyuncs.com"
-              code_path_full="${oss_path}/${code_path}"
-              trigger_file_name="Detect-${profile}-${{ github.run_number }}.json"
-              trigger_path="${object_path}/${trigger_file_name}"
-              result_path="${oss_path}/notifications/${{ github.repository }}/${{ inputs.base_ref }}/${trigger_file_name}"
-              trigger_id="${trigger_file_name%.json}"
-
-              echo "Creating detect trigger event file"
-              cat > trigger-event.json << EOF
-            {
-              "id": "${trigger_id}",
-              "action": "state detect",
-              "codeHeadSha": "${{ inputs.head_sha }}",
-              "codeVersionId": "${version_id}",
-              "codePackagePath": "${code_path_full}",
-              "execResultPath": "${result_path}",
-              "changedFolders": ""
-            }
-          EOF
-
-              echo "Trigger event file content:"
-              cat trigger-event.json
-              python governance/scripts/upload_to_oss.py --key=$trigger_path --file_path=trigger-event.json
-              trigger_exit_code=$?
+              echo "Triggering detect stack execution for profile: $profile"
+          
+              export ACTION="state detect" CODE_MODULE_VERSION="$version_id" CHANGE_FOLDERS=""
+          
+              trigger_output_file=$(mktemp)
+              python governance/scripts/trigger_stack.py --region=$iac_region --code_module_id=$code_module_id 2>&1 | tee "$trigger_output_file"
+              trigger_exit_code=${PIPESTATUS[0]}
+              trigger_output=$(cat "$trigger_output_file")
+              rm -f "$trigger_output_file"
 
               if [ $trigger_exit_code -ne 0 ]; then
-                echo "Error: Failed to upload trigger file to OSS for profile: $profile"
+                echo "Error: Failed to trigger stack execution for profile: $profile"
                 echo "Skipping remaining steps for profile: $profile, continuing with next profile..."
                 failed_profiles+=("$profile")
                 continue
               fi
 
-              echo "Detect trigger file uploaded successfully"
-              result_path_list+=("$profile@$result_path")
+              echo "Detect stack execution triggered successfully"
+              trigger_id=$(echo "$trigger_output" | grep -o 'Trigger ID: [^,]*' | sed 's/.*Trigger ID: //')
+              if [ -z "$trigger_id" ]; then
+                echo "Warning: Could not extract trigger_id from output"
+                failed_profiles+=("$profile")
+                continue
+              fi
+
+              result_path_list+=("$profile@$trigger_id")
             fi
 
           done
@@ -253,6 +238,6 @@ jobs:
             done
             exit 1
           else
-            echo "All source package created and uploaded to OSS"
+            echo "All source package created and uploaded to IaCService"
           fi
           

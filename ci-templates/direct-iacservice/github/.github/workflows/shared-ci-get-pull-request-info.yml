@@ -80,7 +80,7 @@ jobs:
           echo "COMMAND=$command" >> $GITHUB_OUTPUT
           echo "comment_changed_stacks: $all_changed_stacks"
           echo "comment_changed_stacks=$all_changed_stacks" >> $GITHUB_OUTPUT
-         
+
 
       - name: Get PR info
         id: get_pr_info
@@ -169,10 +169,10 @@ jobs:
 
               if [[ $file == deployments/* ]]; then
                   path_without_prefix=${file#deployments/}
-                  
+          
                   profile_name=$(echo "$path_without_prefix" | cut -d'/' -f1)
                   stack_name=$(echo "$path_without_prefix" | cut -d'/' -f2)
-                  
+          
                   index=-1
                   for i in "${!profiles[@]}"; do
                       if [[ "${profiles[i]}" == "$profile_name" ]]; then
@@ -180,7 +180,7 @@ jobs:
                           break
                       fi
                   done
-                  
+          
                   if [[ $index -eq -1 ]]; then
                       profiles+=("$profile_name")
                       stacks+=("$stack_name")

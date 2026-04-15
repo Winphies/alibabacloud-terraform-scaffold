@@ -62,14 +62,17 @@ def validate_arguments(args):
 def validate_configuration(region, code_module_id):
     """Validate configuration"""
     try:
+        # Validate region format
         if not region or len(region) < 3:
             logger.error("Invalid region format")
             return False
 
+        # Validate code_module_id format
         if not code_module_id or len(code_module_id) < 3:
-            logger.error("Invalid code_module_id format")
+            logger.error("Invalid region format")
             return False
 
+        # Check environment variables
         access_key = os.environ.get('IAC_ACCESS_KEY_ID')
         secret_key = os.environ.get('IAC_ACCESS_KEY_SECRET')
 
@@ -109,6 +112,7 @@ def trigger_stack(client, code_module_id, action, code_module_version, change_fo
         logger.info(
             f"trigger stack action: {action}, code_module_id: {code_module_id}, code_module_version: {code_module_version}, change_folders: {change_folders}")
 
+        # 将逗号分隔的字符串转换为列表
         change_folders_list = [folder.strip() for folder in change_folders.split(',')]
         logger.info(f"Parsed change_folders list: {change_folders_list}")
 
@@ -120,7 +124,7 @@ def trigger_stack(client, code_module_id, action, code_module_version, change_fo
         request.changed_folders = change_folders_list
         request.client_token = str(uuid.uuid4())
 
-        result = client.trigger_stack_execution(request);
+        result = client.trigger_stack_execution(request)
 
         logger.info(f'trigger stack successfully\n'
                     f'Status Code: {result.status_code}\n'
@@ -136,16 +140,20 @@ def main():
     try:
         args = parser.parse_args()
 
+        # Validate arguments
         if not validate_arguments(args):
             return 1
 
+        # Validate configuration
         if not validate_configuration(args.region, args.code_module_id):
             return 1
 
+        # Create IaCService client
         client = create_iac_client(args.region)
         if not client:
             return 1
 
+        # Upload file to module
         if trigger_stack(client, args.code_module_id, args.action, args.code_module_version, args.change_folders):
             logger.info("trigger stack completed successfully")
             return 0
